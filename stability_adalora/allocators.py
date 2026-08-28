@@ -207,19 +207,30 @@ class StabilityAwareRankAllocator(ScoreExtractionMixin, RankAllocator):
             rank_pattern = self.mask_to_budget(model, self.current_budget) if force_mask else None
             if force_mask:
                 self.logger.write(
-                    {
-                        "method": "stability",
-                        "step": int(global_step),
-                        "budget": int(self.current_budget),
-                        "stability": self.last_stability,
-                        "q": None,
-                        "q_required": None,
-                        "q_stability": None,
-                        "topk": int(self._topk()),
-                        "settings": asdict(self.settings),
-                        "rank_distribution": self.rank_distribution(model, rank_pattern),
-                    }
-                )
+                {
+                    "method": "stability",
+                    "step": int(global_step),
+                    "budget": int(self.current_budget),
+                    "stability": self.last_stability,
+                    "q": None,
+                    "q_required": None,
+                    "q_stability": None,
+                    "topk": int(self._topk()),
+                    "settings": asdict(self.settings),
+                    "rank_distribution": self.rank_distribution(
+                        model, rank_pattern
+                    ),
+
+                    # Keep logging schema consistent
+                    "high_stability_streak": int(
+                        self.high_stability_streak
+                    ),
+                    "high_stability_confirmed": bool(
+                        self.high_stability_streak
+                        >= self.settings.high_stability_patience
+                    ),
+                }        
+            )
             return self.current_budget, rank_pattern
 
         # Stage 2: only make allocation decisions every deltaT, exactly like AdaLoRA.
@@ -269,6 +280,7 @@ class StabilityAwareRankAllocator(ScoreExtractionMixin, RankAllocator):
                 remaining_rank,
                 max(q_required, q_stability)
             )
+            
         self.current_budget = max(self.target_bgt, self.current_budget - q)
         rank_pattern = self.mask_to_budget(model, self.current_budget)
         self.previous_top_set = current_top_set

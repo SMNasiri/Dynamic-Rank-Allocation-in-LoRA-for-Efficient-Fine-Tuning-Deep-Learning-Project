@@ -190,7 +190,7 @@ def main():
 
     allocator = None
     event_path = out_dir / "rank_events.jsonl"
-    
+
     if args.method in {
         "adalora_diag",
         "extended_cubic",
@@ -204,14 +204,14 @@ def main():
             medium_multiplier=args.medium_multiplier,
             high_multiplier=args.high_multiplier,
             topk_reference=args.topk_reference,
-    
+
             # V1 = 1 checkpoint
             # V2 = 2 consecutive high-stability checkpoints
             high_stability_patience=(
-                2 if args.method == "stability_v2" else 1
+                3 if args.method == "stability_v2" else 1 # parameter is changed by v
             ),
         )
-    
+
         # stability_v2 uses the same StabilityAwareRankAllocator class.
         # The difference is only high_stability_patience=2.
         allocator_method = (
@@ -219,7 +219,7 @@ def main():
             if args.method == "stability_v2"
             else args.method
         )
-    
+
         allocator = install_custom_allocator(
             model,
             allocator_method,
