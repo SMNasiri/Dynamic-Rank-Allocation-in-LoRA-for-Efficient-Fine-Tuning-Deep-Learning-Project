@@ -28,7 +28,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--method", choices=["lora", "adalora", "adalora_diag", "extended_cubic", "stability"], required=True)
     p.add_argument("--model_name", default="roberta-base")
-    p.add_argument("--dataset", default="glue")
+    p.add_argument("--dataset", default="nyu-mll/glue")
     p.add_argument("--task", default="sst2")
     p.add_argument("--max_steps", type=int, default=600)
     p.add_argument("--batch_size", type=int, default=16)
@@ -134,7 +134,7 @@ def prepare_data(args, tokenizer):
     cols_to_remove = [c for c in tokenized["train"].column_names if c not in {"input_ids", "attention_mask", "token_type_ids", "label"}]
     tokenized = tokenized.remove_columns(cols_to_remove)
     tokenized = tokenized.rename_column("label", "labels")
-    tokenized.set_format("torch")
+    # tokenized.set_format("torch")
     collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8 if args.fp16 else None)
     train_loader = DataLoader(tokenized["train"], batch_size=args.batch_size, shuffle=True, collate_fn=collator)
     eval_split = "validation_matched" if args.task == "mnli" else "validation"

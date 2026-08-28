@@ -15,6 +15,7 @@ def parse_args():
     p.add_argument("--max_steps", type=int, default=1500)
     p.add_argument("--root", default="outputs/main")
     p.add_argument("--model_name", default="roberta-base")
+    p.add_argument("--dataset", default="nyu-mll/glue")
     p.add_argument("--task", default="sst2")
     p.add_argument("--batch_size", type=int, default=16)
     return p.parse_args()
@@ -38,6 +39,7 @@ def main():
                 "--model_name", args.model_name,
                 "--task", args.task,
                 "--batch_size", str(args.batch_size),
+                "--dataset", args.dataset,
                 "--output_dir", str(out),
             ]
             print("\n$", " ".join(cmd), flush=True)
