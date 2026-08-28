@@ -288,11 +288,10 @@ class StabilityAwareRankAllocator(ScoreExtractionMixin, RankAllocator):
                 "settings": asdict(self.settings),
                 "rank_distribution": self.rank_distribution(model, rank_pattern),
                 "high_stability_streak": int(self.high_stability_streak),
-                "high_stability_confirmed": bool(high_stability_confirmed),
+            "high_stability_confirmed": bool(high_stability_confirmed), 
             }
         )
         return self.current_budget, rank_pattern
-kjkvjbvjf
 
 def install_custom_allocator(peft_model, method: str, log_path: str | Path, settings: StabilitySettings | None = None):
     """Replace only AdaLoRA's RankAllocator; all decomposition/scoring/masking code stays in PEFT."""
