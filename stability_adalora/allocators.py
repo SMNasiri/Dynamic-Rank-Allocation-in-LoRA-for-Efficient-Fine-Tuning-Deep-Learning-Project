@@ -15,7 +15,6 @@ from peft.tuners.adalora.layer import RankAllocator
 
 from .scheduler import choose_prune_amount, jaccard
 
-
 @dataclass
 class StabilitySettings:
     policy: Literal["binary", "multilevel"] = "multilevel"
@@ -23,9 +22,12 @@ class StabilitySettings:
     tau_high: float = 0.90
     medium_multiplier: float = 1.5
     high_multiplier: float = 3.0
-    # V1 uses a FIXED top-K equal to the final target budget. This avoids
-    # mechanically changing Jaccard set size as the current budget shrinks.
     topk_reference: Literal["target", "current"] = "target"
+
+    # V2:
+    # Require high stability for this many consecutive checkpoints
+    # before aggressive pruning is allowed.
+    high_stability_patience: int = 1
 
 
 class JsonlLogger:
@@ -175,7 +177,7 @@ class StabilityAwareRankAllocator(ScoreExtractionMixin, RankAllocator):
         self.current_budget = int(self.init_bgt)
         self.previous_top_set: frozenset[str] | None = None
         self.last_stability: float | None = None
-
+        self.high_stability_streak = 0
     def _remaining_checkpoints(self, step: int) -> int:
         stabilization_start = self.peft_config.total_step - self.peft_config.tfinal
         if step >= stabilization_start:
@@ -226,6 +228,15 @@ class StabilityAwareRankAllocator(ScoreExtractionMixin, RankAllocator):
 
         current_top_set = self.global_top_set(model, self._topk())
         stability = jaccard(current_top_set, self.previous_top_set)
+        if stability is not None and stability >= self.settings.tau_high:
+            self.high_stability_streak += 1
+        else:
+            self.high_stability_streak = 0
+
+        high_stability_confirmed = (
+            self.high_stability_streak
+            >= self.settings.high_stability_patience
+        )
         remaining_checkpoints = self._remaining_checkpoints(global_step)
         q, q_required, q_stability = choose_prune_amount(
             current_budget=self.current_budget,
@@ -238,6 +249,26 @@ class StabilityAwareRankAllocator(ScoreExtractionMixin, RankAllocator):
             medium_multiplier=self.settings.medium_multiplier,
             high_multiplier=self.settings.high_multiplier,
         )
+        # V2: a single high-stability checkpoint is not enough
+        # to trigger aggressive pruning.
+        if (
+        stability is not None
+        and stability >= self.settings.tau_high
+        and not high_stability_confirmed
+        ):
+            q_stability = math.ceil(
+            self.settings.medium_multiplier * q_required
+            )
+
+            remaining_rank = max(
+            0,
+            self.current_budget - self.target_bgt
+            )
+
+            q = min(
+                remaining_rank,
+                max(q_required, q_stability)
+            )
         self.current_budget = max(self.target_bgt, self.current_budget - q)
         rank_pattern = self.mask_to_budget(model, self.current_budget)
         self.previous_top_set = current_top_set

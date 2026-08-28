@@ -26,7 +26,7 @@ from stability_adalora.allocators import StabilitySettings, install_custom_alloc
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--method", choices=["lora", "adalora", "adalora_diag", "extended_cubic", "stability"], required=True)
+    p.add_argument("--method", choices=["lora", "adalora", "adalora_diag", "extended_cubic", "stability", "stability_v2"], required=True)
     p.add_argument("--model_name", default="roberta-base")
     p.add_argument("--dataset", default="nyu-mll/glue")
     p.add_argument("--task", default="sst2")
@@ -190,7 +190,13 @@ def main():
 
     allocator = None
     event_path = out_dir / "rank_events.jsonl"
-    if args.method in {"adalora_diag", "extended_cubic", "stability"}:
+    
+    if args.method in {
+        "adalora_diag",
+        "extended_cubic",
+        "stability",
+        "stability_v2",
+    }:
         settings = StabilitySettings(
             policy=args.stability_policy,
             tau_low=args.tau_low,
@@ -198,8 +204,28 @@ def main():
             medium_multiplier=args.medium_multiplier,
             high_multiplier=args.high_multiplier,
             topk_reference=args.topk_reference,
+    
+            # V1 = 1 checkpoint
+            # V2 = 2 consecutive high-stability checkpoints
+            high_stability_patience=(
+                2 if args.method == "stability_v2" else 1
+            ),
         )
-        allocator = install_custom_allocator(model, args.method, event_path, settings=settings)
+    
+        # stability_v2 uses the same StabilityAwareRankAllocator class.
+        # The difference is only high_stability_patience=2.
+        allocator_method = (
+            "stability"
+            if args.method == "stability_v2"
+            else args.method
+        )
+    
+        allocator = install_custom_allocator(
+            model,
+            allocator_method,
+            event_path,
+            settings=settings,
+        )
 
     trainable, total = count_trainable(model)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.learning_rate, weight_decay=args.weight_decay)
