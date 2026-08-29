@@ -7,7 +7,14 @@ import subprocess
 import time
 from pathlib import Path
 
-import evaluate
+import numpy as np
+
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    matthews_corrcoef,
+)
 import torch
 from datasets import load_dataset
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
@@ -320,35 +327,142 @@ def prepare_data(args, tokenizer):
 
     return train_loader, eval_loaders
 
+def compute_glue_metrics(
+    task: str,
+    predictions: np.ndarray,
+    references: np.ndarray,
+) -> dict[str, float]:
+
+    if task in {"sst2", "mnli", "qnli", "rte"}:
+        return {
+            "accuracy": float(
+                accuracy_score(references, predictions)
+            )
+        }
+
+    if task == "cola":
+        return {
+            "matthews_correlation": float(
+                matthews_corrcoef(
+                    references,
+                    predictions,
+                )
+            )
+        }
+
+    if task in {"mrpc", "qqp"}:
+        return {
+            "accuracy": float(
+                accuracy_score(
+                    references,
+                    predictions,
+                )
+            ),
+            "f1": float(
+                f1_score(
+                    references,
+                    predictions,
+                )
+            ),
+        }
+
+    if task == "stsb":
+        return {
+            "pearson": float(
+                pearsonr(
+                    predictions,
+                    references,
+                ).statistic
+            ),
+            "spearmanr": float(
+                spearmanr(
+                    predictions,
+                    references,
+                ).statistic
+            ),
+        }
+
+    raise ValueError(
+        f"Unsupported GLUE task: {task}"
+    )
 
 @torch.no_grad()
-def evaluate_loader(model, loader, device, task: str) -> dict[str, float]:
+def evaluate_loader(
+    model,
+    loader,
+    device,
+    task: str,
+) -> dict[str, float]:
+
     model.eval()
-    metric = evaluate.load("glue", task)
+
+    all_predictions = []
+    all_references = []
+
     total = 0
     loss_sum = 0.0
 
     for batch in loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {
+            k: v.to(device)
+            for k, v in batch.items()
+        }
+
         out = model(**batch)
+
         labels = batch["labels"]
-        bs = labels.shape[0]
-        total += bs
-        loss_sum += out.loss.item() * bs
+        batch_size = labels.shape[0]
 
-        if task == "stsb":
-            predictions = out.logits.squeeze(-1)
-        else:
-            predictions = out.logits.argmax(dim=-1)
-
-        metric.add_batch(
-            predictions=predictions.detach().cpu().numpy(),
-            references=labels.detach().cpu().numpy(),
+        total += batch_size
+        loss_sum += (
+            out.loss.item() * batch_size
         )
 
-    metrics = {k: float(v) for k, v in metric.compute().items()}
-    metrics["eval_loss"] = loss_sum / total
+        if task == "stsb":
+            predictions = (
+                out.logits.squeeze(-1)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+        else:
+            predictions = (
+                out.logits.argmax(dim=-1)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+        references = (
+            labels
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        all_predictions.append(predictions)
+        all_references.append(references)
+
+    predictions = np.concatenate(
+        all_predictions
+    )
+
+    references = np.concatenate(
+        all_references
+    )
+
+    metrics = compute_glue_metrics(
+        task,
+        predictions,
+        references,
+    )
+
+    metrics["eval_loss"] = (
+        loss_sum / total
+    )
+
     model.train()
+
     return metrics
 
 
