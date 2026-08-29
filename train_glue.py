@@ -8,14 +8,9 @@ import time
 from pathlib import Path
 
 import numpy as np
-
-from scipy.stats import pearsonr, spearmanr
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    matthews_corrcoef,
-)
 import torch
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import accuracy_score, f1_score, matthews_corrcoef
 from datasets import load_dataset
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
 from torch.utils.data import DataLoader
@@ -158,7 +153,21 @@ def parse_args():
         ),
     )
     p.add_argument("--output_dir", default="outputs/run")
-    p.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--fp16",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable CUDA FP16 autocast + GradScaler. Disabled by default for "
+            "numerically safer validation runs."
+        ),
+    )
+    p.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Maximum gradient norm. Set <= 0 to disable clipping.",
+    )
     return p.parse_args()
 
 
@@ -327,144 +336,75 @@ def prepare_data(args, tokenizer):
 
     return train_loader, eval_loaders
 
+
 def compute_glue_metrics(
     task: str,
     predictions: np.ndarray,
     references: np.ndarray,
 ) -> dict[str, float]:
-
     if task in {"sst2", "mnli", "qnli", "rte"}:
         return {
-            "accuracy": float(
-                accuracy_score(references, predictions)
-            )
+            "accuracy": float(accuracy_score(references, predictions)),
         }
 
     if task == "cola":
         return {
             "matthews_correlation": float(
-                matthews_corrcoef(
-                    references,
-                    predictions,
-                )
-            )
+                matthews_corrcoef(references, predictions)
+            ),
         }
 
     if task in {"mrpc", "qqp"}:
         return {
-            "accuracy": float(
-                accuracy_score(
-                    references,
-                    predictions,
-                )
-            ),
-            "f1": float(
-                f1_score(
-                    references,
-                    predictions,
-                )
-            ),
+            "accuracy": float(accuracy_score(references, predictions)),
+            "f1": float(f1_score(references, predictions)),
         }
 
     if task == "stsb":
+        pearson = pearsonr(predictions, references)[0]
+        spearman = spearmanr(predictions, references)[0]
         return {
-            "pearson": float(
-                pearsonr(
-                    predictions,
-                    references,
-                ).statistic
-            ),
-            "spearmanr": float(
-                spearmanr(
-                    predictions,
-                    references,
-                ).statistic
-            ),
+            "pearson": float(pearson),
+            "spearmanr": float(spearman),
         }
 
-    raise ValueError(
-        f"Unsupported GLUE task: {task}"
-    )
+    raise ValueError(f"Unsupported GLUE task: {task}")
+
 
 @torch.no_grad()
-def evaluate_loader(
-    model,
-    loader,
-    device,
-    task: str,
-) -> dict[str, float]:
-
+def evaluate_loader(model, loader, device, task: str) -> dict[str, float]:
     model.eval()
-
-    all_predictions = []
-    all_references = []
-
     total = 0
     loss_sum = 0.0
+    all_predictions: list[np.ndarray] = []
+    all_references: list[np.ndarray] = []
 
     for batch in loader:
-        batch = {
-            k: v.to(device)
-            for k, v in batch.items()
-        }
-
+        batch = {k: v.to(device) for k, v in batch.items()}
         out = model(**batch)
-
         labels = batch["labels"]
-        batch_size = labels.shape[0]
-
-        total += batch_size
-        loss_sum += (
-            out.loss.item() * batch_size
-        )
+        bs = labels.shape[0]
+        total += bs
+        loss_sum += out.loss.item() * bs
 
         if task == "stsb":
-            predictions = (
-                out.logits.squeeze(-1)
-                .detach()
-                .cpu()
-                .numpy()
-            )
+            predictions = out.logits.squeeze(-1)
         else:
-            predictions = (
-                out.logits.argmax(dim=-1)
-                .detach()
-                .cpu()
-                .numpy()
-            )
+            predictions = out.logits.argmax(dim=-1)
 
-        references = (
-            labels
-            .detach()
-            .cpu()
-            .numpy()
-        )
+        if task == "stsb":
+            all_predictions.append(predictions.detach().float().cpu().numpy())
+            all_references.append(labels.detach().float().cpu().numpy())
+        else:
+            all_predictions.append(predictions.detach().cpu().numpy())
+            all_references.append(labels.detach().cpu().numpy())
 
-        all_predictions.append(predictions)
-        all_references.append(references)
-
-    predictions = np.concatenate(
-        all_predictions
-    )
-
-    references = np.concatenate(
-        all_references
-    )
-
-    metrics = compute_glue_metrics(
-        task,
-        predictions,
-        references,
-    )
-
-    metrics["eval_loss"] = (
-        loss_sum / total
-    )
-
+    predictions_np = np.concatenate(all_predictions)
+    references_np = np.concatenate(all_references)
+    metrics = compute_glue_metrics(task, predictions_np, references_np)
+    metrics["eval_loss"] = loss_sum / total
     model.train()
-
     return metrics
-
 
 def evaluate_all(model, eval_loaders, device, task: str) -> dict[str, float]:
     primary = evaluate_loader(model, eval_loaders["primary"], device, task)
@@ -487,6 +427,23 @@ def count_trainable(model):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     return trainable, total
+
+
+def cast_trainable_parameters_to_fp32(model) -> None:
+    """Keep trainable adapter/head parameters in FP32 for stable AMP scaling."""
+    for parameter in model.parameters():
+        if parameter.requires_grad and parameter.dtype != torch.float32:
+            parameter.data = parameter.data.float()
+
+
+def trainable_dtype_summary(model) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+        key = str(parameter.dtype)
+        summary[key] = summary.get(key, 0) + parameter.numel()
+    return summary
 
 
 def adapter_checkpoint_mb(model, out_dir: Path):
@@ -528,6 +485,12 @@ def main():
     model, adalora_config, resolved_target_modules = build_model(args)
     model.to(device)
 
+    # GradScaler cannot safely unscale gradients that are themselves FP16.
+    # Keeping trainable PEFT/head parameters in FP32 is the standard safe setup
+    # while frozen backbone weights may still participate in autocast.
+    cast_trainable_parameters_to_fp32(model)
+    print("Trainable parameter dtypes:", trainable_dtype_summary(model))
+
     allocator = None
     event_path = out_dir / "rank_events.jsonl"
     budget_trace_path = out_dir / "budget_trace.jsonl"
@@ -565,7 +528,7 @@ def main():
     )
 
     use_amp = bool(args.fp16)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
     model.train()
     optimizer.zero_grad(set_to_none=True)
     torch.cuda.empty_cache()
@@ -582,18 +545,44 @@ def main():
                 break
             step += 1
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            with torch.autocast(
-                device_type="cuda",
-                dtype=torch.float16,
-                enabled=use_amp,
-            ):
+            if use_amp:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    loss = model(**batch).loss
+            else:
                 loss = model(**batch).loss
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            scaler.step(optimizer)
-            scaler.update()
 
-            # PEFT AdaLoRA updates importance/allocation after backward while gradients exist.
+            if not torch.isfinite(loss).item():
+                raise RuntimeError(
+                    f"Non-finite loss at step {step}: {loss.detach().float().item()}"
+                )
+
+            if use_amp:
+                assert scaler is not None
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+            else:
+                loss.backward()
+
+            trainable_parameters = [
+                p for p in model.parameters() if p.requires_grad and p.grad is not None
+            ]
+            if args.max_grad_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    trainable_parameters,
+                    max_norm=args.max_grad_norm,
+                    error_if_nonfinite=True,
+                )
+            else:
+                grad_norm = None
+
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+
+            # PEFT AdaLoRA requires update_and_allocate after backward/optimizer.step
+            # and before zero_grad(), while gradients are still available.
             if args.method != "lora":
                 model.base_model.update_and_allocate(step)
                 rank_allocator = model.base_model.rankallocator
@@ -621,9 +610,8 @@ def main():
     peak_allocated_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
     peak_reserved_mb = torch.cuda.max_memory_reserved(device) / (1024**2)
 
-    eval_metrics = evaluate_all(model, eval_loaders, device, args.task)
-    checkpoint_mb = adapter_checkpoint_mb(model, out_dir)
-
+    # Verify rank allocation before evaluation/saving so invalid runs are never
+    # written out as if they were successful experiments.
     final_rank_distribution = None
     final_active_rank = None
     expected_target_budget = None
@@ -631,23 +619,31 @@ def main():
         adapter_name = model.base_model.trainable_adapter_name
         peft_config = model.base_model.peft_config[adapter_name]
         pattern = peft_config.rank_pattern
-        if pattern:
-            final_rank_distribution = {
-                key: int(sum(mask))
-                for key, mask in pattern.items()
-            }
-            final_active_rank = active_rank_from_pattern(pattern)
-
         expected_target_budget = int(model.base_model.rankallocator.target_bgt)
+
+        if not pattern:
+            raise AssertionError(
+                "AdaLoRA finished without a final rank_pattern. "
+                "The final allocation step did not complete correctly."
+            )
+
+        final_rank_distribution = {
+            key: int(sum(mask)) for key, mask in pattern.items()
+        }
+        final_active_rank = active_rank_from_pattern(pattern)
+
         if last_budget != expected_target_budget:
             raise AssertionError(
                 f"Final budget mismatch: {last_budget} != {expected_target_budget}"
             )
-        if final_active_rank is not None and final_active_rank != expected_target_budget:
+        if final_active_rank != expected_target_budget:
             raise AssertionError(
                 "Final active rank mismatch: "
                 f"{final_active_rank} != {expected_target_budget}"
             )
+
+    eval_metrics = evaluate_all(model, eval_loaders, device, args.task)
+    checkpoint_mb = adapter_checkpoint_mb(model, out_dir)
 
     primary_metric_name = GLUE_TASKS[args.task]["primary_metric"]
     primary_metric = float(eval_metrics[primary_metric_name])
@@ -677,6 +673,9 @@ def main():
         "final_rank_distribution": final_rank_distribution,
         "resolved_target_modules": resolved_target_modules,
         "high_stability_patience": args.high_stability_patience,
+        "fp16": bool(args.fp16),
+        "max_grad_norm": args.max_grad_norm,
+        "trainable_parameter_dtypes": trainable_dtype_summary(model),
         "git_commit": git_commit(),
         "environment": {
             "python": platform.python_version(),
@@ -684,7 +683,8 @@ def main():
             "transformers": package_version("transformers"),
             "peft": package_version("peft"),
             "datasets": package_version("datasets"),
-            "evaluate": package_version("evaluate"),
+            "scikit_learn": package_version("scikit-learn"),
+            "scipy": package_version("scipy"),
             "gpu": torch.cuda.get_device_name(device),
         },
     }
