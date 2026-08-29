@@ -485,10 +485,17 @@ def main():
     model, adalora_config, resolved_target_modules = build_model(args)
     model.to(device)
 
-    # GradScaler cannot safely unscale gradients that are themselves FP16.
-    # Keeping trainable PEFT/head parameters in FP32 is the standard safe setup
-    # while frozen backbone weights may still participate in autocast.
-    cast_trainable_parameters_to_fp32(model)
+    # Precision policy:
+    # - In FP32 mode, force the *entire* PEFT model (backbone, adapters, and
+    #   modules_to_save classification head) to FP32. Casting only trainable
+    #   parameters can create Half/Float matmul mismatches in DeBERTa.
+    # - In AMP mode, leave the backbone at its loaded dtype but keep trainable
+    #   adapter/head parameters in FP32 so GradScaler can unscale them safely.
+    if args.fp16:
+        cast_trainable_parameters_to_fp32(model)
+    else:
+        model.float()
+
     print("Trainable parameter dtypes:", trainable_dtype_summary(model))
 
     allocator = None
