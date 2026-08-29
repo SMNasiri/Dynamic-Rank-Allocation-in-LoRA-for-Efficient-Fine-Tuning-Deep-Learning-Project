@@ -27,7 +27,7 @@ class StabilitySettings:
     # V2:
     # Require high stability for this many consecutive checkpoints
     # before aggressive pruning is allowed.
-    high_stability_patience: int = 1
+    high_stability_patience: int = 3
 
 
 class JsonlLogger:

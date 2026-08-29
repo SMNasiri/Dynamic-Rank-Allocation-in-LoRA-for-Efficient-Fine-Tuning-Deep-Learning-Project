@@ -18,6 +18,15 @@ def parse_args():
     p.add_argument("--dataset", default="nyu-mll/glue")
     p.add_argument("--task", default="sst2")
     p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument(
+    "--high_stability_patience",
+    type=int,
+    default=3,
+    help=(
+        "Number of consecutive high-stability checkpoints "
+        "required before aggressive pruning."
+    ),
+)
     return p.parse_args()
 
 
@@ -42,6 +51,11 @@ def main():
                 "--dataset", args.dataset,
                 "--output_dir", str(out),
             ]
+            if method == "stability":
+                cmd += [
+                    "--high_stability_patience",
+                    str(args.high_stability_patience),
+                ]
             print("\n$", " ".join(cmd), flush=True)
             subprocess.run(cmd, check=True)
             result = json.loads((out / "result.json").read_text())

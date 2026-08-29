@@ -26,7 +26,7 @@ from stability_adalora.allocators import StabilitySettings, install_custom_alloc
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--method", choices=["lora", "adalora", "adalora_diag", "extended_cubic", "stability", "stability_v2"], required=True)
+    p.add_argument("--method", choices=["lora", "adalora", "adalora_diag", "extended_cubic", "stability"], required=True)
     p.add_argument("--model_name", default="roberta-base")
     p.add_argument("--dataset", default="nyu-mll/glue")
     p.add_argument("--task", default="sst2")
@@ -57,6 +57,12 @@ def parse_args():
     p.add_argument("--topk_reference", choices=["target", "current"], default="target")
     p.add_argument("--output_dir", default="outputs/run")
     p.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+    "--high_stability_patience",
+    type=int,
+    default=3,
+    help="Number of consecutive high-stability checkpoints required before aggressive pruning.",
+)
     return p.parse_args()
 
 
@@ -195,7 +201,6 @@ def main():
         "adalora_diag",
         "extended_cubic",
         "stability",
-        "stability_v2",
     }:
         settings = StabilitySettings(
             policy=args.stability_policy,
@@ -207,18 +212,12 @@ def main():
 
             # V1 = 1 checkpoint
             # V2 = 2 consecutive high-stability checkpoints
-            high_stability_patience=(
-                3 if args.method == "stability_v2" else 1 # parameter is changed by v
-            ),
+            high_stability_patience=args.high_stability_patience,
         )
 
         # stability_v2 uses the same StabilityAwareRankAllocator class.
         # The difference is only high_stability_patience=2.
-        allocator_method = (
-            "stability"
-            if args.method == "stability_v2"
-            else args.method
-        )
+        allocator_method = args.method
 
         allocator = install_custom_allocator(
             model,
