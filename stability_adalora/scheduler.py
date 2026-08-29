@@ -30,7 +30,7 @@ def stability_prune(
     medium_multiplier: float = 1.5,
     high_multiplier: float = 3.0,
 ) -> int:
-    """Extra pruning suggested by stability. The deadline floor is applied separately."""
+    """Pruning suggested by stability. The deadline floor is applied separately."""
     if stability is None or q_required == 0:
         return 0
 
@@ -59,7 +59,7 @@ def choose_prune_amount(
     medium_multiplier: float = 1.5,
     high_multiplier: float = 3.0,
 ) -> tuple[int, int, int]:
-    """Return (actual_q, q_required, q_stability), clipped to the remaining rank."""
+    """Return (actual_q, q_required, q_stability), clipped to remaining rank."""
     remaining_rank = max(0, current_budget - target_budget)
     q_req = required_prune(current_budget, target_budget, remaining_checkpoints)
     q_stab = stability_prune(
@@ -73,3 +73,54 @@ def choose_prune_amount(
     )
     q = min(remaining_rank, max(q_req, q_stab))
     return q, q_req, q_stab
+
+
+def update_high_stability_streak(
+    stability: float | None,
+    current_streak: int,
+    tau_high: float,
+) -> int:
+    """Update the number of consecutive checkpoints with stability >= tau_high."""
+    if stability is not None and stability >= tau_high:
+        return int(current_streak) + 1
+    return 0
+
+
+def is_high_stability_confirmed(streak: int, patience: int) -> bool:
+    """Return True once the high-stability streak reaches the configured patience."""
+    if patience < 1:
+        raise ValueError("high_stability_patience must be >= 1")
+    return int(streak) >= int(patience)
+
+
+def apply_persistence_gate(
+    *,
+    current_budget: int,
+    target_budget: int,
+    stability: float | None,
+    q: int,
+    q_required: int,
+    q_stability: int,
+    high_stability_confirmed: bool,
+    tau_high: float,
+    medium_multiplier: float,
+) -> tuple[int, int]:
+    """
+    Prevent an unconfirmed high-stability checkpoint from immediately using the
+    aggressive high-stability multiplier. Until persistence is confirmed, treat
+    the checkpoint as medium-confidence pruning.
+
+    Returns (actual_q, adjusted_q_stability).
+    """
+    if (
+        stability is None
+        or stability < tau_high
+        or high_stability_confirmed
+        or q_required == 0
+    ):
+        return q, q_stability
+
+    adjusted_q_stability = math.ceil(medium_multiplier * q_required)
+    remaining_rank = max(0, current_budget - target_budget)
+    adjusted_q = min(remaining_rank, max(q_required, adjusted_q_stability))
+    return adjusted_q, adjusted_q_stability

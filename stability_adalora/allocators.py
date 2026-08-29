@@ -13,7 +13,14 @@ from .compat import assert_peft_compat
 assert_peft_compat()
 from peft.tuners.adalora.layer import RankAllocator
 
-from .scheduler import choose_prune_amount, jaccard
+from .scheduler import (
+    apply_persistence_gate,
+    choose_prune_amount,
+    is_high_stability_confirmed,
+    jaccard,
+    update_high_stability_streak,
+)
+
 
 @dataclass
 class StabilitySettings:
@@ -23,10 +30,6 @@ class StabilitySettings:
     medium_multiplier: float = 1.5
     high_multiplier: float = 3.0
     topk_reference: Literal["target", "current"] = "target"
-
-    # V2:
-    # Require high stability for this many consecutive checkpoints
-    # before aggressive pruning is allowed.
     high_stability_patience: int = 3
 
 
@@ -45,7 +48,7 @@ class JsonlLogger:
 
 
 class ScoreExtractionMixin:
-    """Extract the exact triplet scores PEFT computes inside mask_to_budget()."""
+    """Extract the same triplet scores PEFT computes inside mask_to_budget()."""
 
     def triplet_scores(self, model) -> dict[str, torch.Tensor]:
         value_ipt: dict[str, torch.Tensor] = {}
@@ -79,7 +82,10 @@ class ScoreExtractionMixin:
         items: list[tuple[float, str]] = []
         for name, scores in self.triplet_scores(model).items():
             values = scores.detach().float().cpu().tolist()
-            items.extend((float(score), f"{name}::{idx}") for idx, score in enumerate(values))
+            items.extend(
+                (float(score), f"{name}::{idx}")
+                for idx, score in enumerate(values)
+            )
         items.sort(key=lambda x: x[0], reverse=True)
         k = min(max(0, int(k)), len(items))
         return frozenset(component_id for _, component_id in items[:k])
@@ -93,7 +99,14 @@ class ScoreExtractionMixin:
 class DiagnosticRankAllocator(ScoreExtractionMixin, RankAllocator):
     """Native AdaLoRA schedule + read-only Jaccard diagnostics."""
 
-    def __init__(self, model, peft_config, adapter_name, log_path=None, topk_reference="target"):
+    def __init__(
+        self,
+        model,
+        peft_config,
+        adapter_name,
+        log_path=None,
+        topk_reference="target",
+    ):
         super().__init__(model, peft_config, adapter_name)
         self.logger = JsonlLogger(log_path)
         self.previous_top_set: frozenset[str] | None = None
@@ -153,14 +166,17 @@ class ExtendedCubicRankAllocator(RankAllocator):
                     "q": None,
                     "q_required": None,
                     "q_stability": None,
-                    "rank_distribution": {name: int(sum(mask)) for name, mask in rank_pattern.items()},
+                    "rank_distribution": {
+                        name: int(sum(mask))
+                        for name, mask in rank_pattern.items()
+                    },
                 }
             )
         return budget, rank_pattern
 
 
 class StabilityAwareRankAllocator(ScoreExtractionMixin, RankAllocator):
-    """AdaLoRA rank allocator that changes only the temporal budget-reduction policy."""
+    """AdaLoRA allocator that changes only the temporal budget-reduction policy."""
 
     def __init__(
         self,
@@ -173,21 +189,66 @@ class StabilityAwareRankAllocator(ScoreExtractionMixin, RankAllocator):
     ):
         super().__init__(model, peft_config, adapter_name)
         self.settings = settings or StabilitySettings()
+        if self.settings.high_stability_patience < 1:
+            raise ValueError("high_stability_patience must be >= 1")
+        if not (0.0 <= self.settings.tau_low <= self.settings.tau_high <= 1.0):
+            raise ValueError("Require 0 <= tau_low <= tau_high <= 1")
+
         self.logger = JsonlLogger(log_path)
         self.current_budget = int(self.init_bgt)
         self.previous_top_set: frozenset[str] | None = None
         self.last_stability: float | None = None
         self.high_stability_streak = 0
+
     def _remaining_checkpoints(self, step: int) -> int:
         stabilization_start = self.peft_config.total_step - self.peft_config.tfinal
         if step >= stabilization_start:
             return 1
-        return max(1, math.ceil((stabilization_start - step) / self.peft_config.deltaT))
+        return max(
+            1,
+            math.ceil(
+                (stabilization_start - step) / self.peft_config.deltaT
+            ),
+        )
 
     def _topk(self) -> int:
         if self.settings.topk_reference == "current":
             return self.current_budget
         return self.target_bgt
+
+    def _log_event(
+        self,
+        *,
+        model,
+        global_step: int,
+        rank_pattern,
+        stability,
+        q,
+        q_required,
+        q_stability,
+        remaining_checkpoints=None,
+    ) -> None:
+        confirmed = is_high_stability_confirmed(
+            self.high_stability_streak,
+            self.settings.high_stability_patience,
+        )
+        record = {
+            "method": "stability",
+            "step": int(global_step),
+            "budget": int(self.current_budget),
+            "stability": stability,
+            "q": None if q is None else int(q),
+            "q_required": None if q_required is None else int(q_required),
+            "q_stability": None if q_stability is None else int(q_stability),
+            "topk": int(self._topk()),
+            "settings": asdict(self.settings),
+            "rank_distribution": self.rank_distribution(model, rank_pattern),
+            "high_stability_streak": int(self.high_stability_streak),
+            "high_stability_confirmed": bool(confirmed),
+        }
+        if remaining_checkpoints is not None:
+            record["remaining_checkpoints"] = int(remaining_checkpoints)
+        self.logger.write(record)
 
     def update_and_allocate(self, model, global_step, force_mask=False):
         cfg = self.peft_config
@@ -196,58 +257,48 @@ class StabilityAwareRankAllocator(ScoreExtractionMixin, RankAllocator):
         if global_step < stabilization_start:
             self.update_ipt(model)
 
-        # Stage 1: warm-up, unchanged.
+        # Stage 1: standard AdaLoRA warm-up.
         if global_step <= cfg.tinit:
             self.current_budget = self.init_bgt
             return self.current_budget, None
 
-        # Stage 3 boundary: guarantee exact final target before fixed stabilization.
+        # Stage 3: exact target budget and fixed-rank stabilization.
         if global_step >= stabilization_start:
+            needs_mask = self.current_budget != self.target_bgt or force_mask
             self.current_budget = self.target_bgt
-            rank_pattern = self.mask_to_budget(model, self.current_budget) if force_mask else None
-            if force_mask:
-                self.logger.write(
-                {
-                    "method": "stability",
-                    "step": int(global_step),
-                    "budget": int(self.current_budget),
-                    "stability": self.last_stability,
-                    "q": None,
-                    "q_required": None,
-                    "q_stability": None,
-                    "topk": int(self._topk()),
-                    "settings": asdict(self.settings),
-                    "rank_distribution": self.rank_distribution(
-                        model, rank_pattern
-                    ),
-
-                    # Keep logging schema consistent
-                    "high_stability_streak": int(
-                        self.high_stability_streak
-                    ),
-                    "high_stability_confirmed": bool(
-                        self.high_stability_streak
-                        >= self.settings.high_stability_patience
-                    ),
-                }        
+            rank_pattern = (
+                self.mask_to_budget(model, self.current_budget)
+                if needs_mask
+                else None
             )
+            if needs_mask:
+                self._log_event(
+                    model=model,
+                    global_step=global_step,
+                    rank_pattern=rank_pattern,
+                    stability=self.last_stability,
+                    q=None,
+                    q_required=None,
+                    q_stability=None,
+                )
             return self.current_budget, rank_pattern
 
-        # Stage 2: only make allocation decisions every deltaT, exactly like AdaLoRA.
+        # Stage 2: allocation decisions every deltaT.
         if global_step % cfg.deltaT != 0 and not force_mask:
             return self.current_budget, None
 
         current_top_set = self.global_top_set(model, self._topk())
         stability = jaccard(current_top_set, self.previous_top_set)
-        if stability is not None and stability >= self.settings.tau_high:
-            self.high_stability_streak += 1
-        else:
-            self.high_stability_streak = 0
-
-        high_stability_confirmed = (
-            self.high_stability_streak
-            >= self.settings.high_stability_patience
+        self.high_stability_streak = update_high_stability_streak(
+            stability,
+            self.high_stability_streak,
+            self.settings.tau_high,
         )
+        high_stability_confirmed = is_high_stability_confirmed(
+            self.high_stability_streak,
+            self.settings.high_stability_patience,
+        )
+
         remaining_checkpoints = self._remaining_checkpoints(global_step)
         q, q_required, q_stability = choose_prune_amount(
             current_budget=self.current_budget,
@@ -260,62 +311,66 @@ class StabilityAwareRankAllocator(ScoreExtractionMixin, RankAllocator):
             medium_multiplier=self.settings.medium_multiplier,
             high_multiplier=self.settings.high_multiplier,
         )
-        # V2: a single high-stability checkpoint is not enough
-        # to trigger aggressive pruning.
-        if (
-        stability is not None
-        and stability >= self.settings.tau_high
-        and not high_stability_confirmed
-        ):
-            q_stability = math.ceil(
-            self.settings.medium_multiplier * q_required
-            )
+        q, q_stability = apply_persistence_gate(
+            current_budget=self.current_budget,
+            target_budget=self.target_bgt,
+            stability=stability,
+            q=q,
+            q_required=q_required,
+            q_stability=q_stability,
+            high_stability_confirmed=high_stability_confirmed,
+            tau_high=self.settings.tau_high,
+            medium_multiplier=self.settings.medium_multiplier,
+        )
 
-            remaining_rank = max(
-            0,
-            self.current_budget - self.target_bgt
-            )
-
-            q = min(
-                remaining_rank,
-                max(q_required, q_stability)
-            )
-            
-        self.current_budget = max(self.target_bgt, self.current_budget - q)
+        self.current_budget = max(
+            self.target_bgt,
+            self.current_budget - q,
+        )
         rank_pattern = self.mask_to_budget(model, self.current_budget)
         self.previous_top_set = current_top_set
         self.last_stability = stability
 
-        self.logger.write(
-            {
-                "method": "stability",
-                "step": int(global_step),
-                "budget": int(self.current_budget),
-                "stability": stability,
-                "q": int(q),
-                "q_required": int(q_required),
-                "q_stability": int(q_stability),
-                "topk": int(self._topk()),
-                "remaining_checkpoints": int(remaining_checkpoints),
-                "settings": asdict(self.settings),
-                "rank_distribution": self.rank_distribution(model, rank_pattern),
-                "high_stability_streak": int(self.high_stability_streak),
-            "high_stability_confirmed": bool(high_stability_confirmed), 
-            }
+        self._log_event(
+            model=model,
+            global_step=global_step,
+            rank_pattern=rank_pattern,
+            stability=stability,
+            q=q,
+            q_required=q_required,
+            q_stability=q_stability,
+            remaining_checkpoints=remaining_checkpoints,
         )
         return self.current_budget, rank_pattern
 
-def install_custom_allocator(peft_model, method: str, log_path: str | Path, settings: StabilitySettings | None = None):
-    """Replace only AdaLoRA's RankAllocator; all decomposition/scoring/masking code stays in PEFT."""
+
+def install_custom_allocator(
+    peft_model,
+    method: str,
+    log_path: str | Path,
+    settings: StabilitySettings | None = None,
+):
+    """Replace only AdaLoRA's RankAllocator; scoring/masking stays in PEFT."""
     adalora_model = peft_model.base_model
     adapter_name = adalora_model.trainable_adapter_name
     config = adalora_model.peft_config[adapter_name]
     backbone = adalora_model.model
 
     if method == "adalora_diag":
-        allocator = DiagnosticRankAllocator(backbone, config, adapter_name, log_path=log_path)
+        allocator = DiagnosticRankAllocator(
+            backbone,
+            config,
+            adapter_name,
+            log_path=log_path,
+            topk_reference=(settings.topk_reference if settings else "target"),
+        )
     elif method == "extended_cubic":
-        allocator = ExtendedCubicRankAllocator(backbone, config, adapter_name, log_path=log_path)
+        allocator = ExtendedCubicRankAllocator(
+            backbone,
+            config,
+            adapter_name,
+            log_path=log_path,
+        )
     elif method == "stability":
         allocator = StabilityAwareRankAllocator(
             backbone,
