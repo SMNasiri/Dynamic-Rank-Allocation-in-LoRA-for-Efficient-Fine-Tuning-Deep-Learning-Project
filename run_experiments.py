@@ -25,6 +25,11 @@ def parse_args():
     p.add_argument("--warmup_ratio", type=float, default=0.06)
     p.add_argument("--init_r", type=int, default=12)
     p.add_argument("--target_r", type=int, default=4)
+    p.add_argument("--rank_init", choices=["uniform", "gora"], default="uniform")
+    p.add_argument("--gora_reference_rank", type=int, default=8)
+    p.add_argument("--gora_min_rank", type=int, default=4)
+    p.add_argument("--gora_max_rank", type=int, default=32)
+    p.add_argument("--gora_probe_batches", type=int, default=64)
     p.add_argument("--lora_alpha", type=int, default=16)
     p.add_argument("--adalora_warmup_ratio", type=float, default=0.10)
     p.add_argument("--adalora_final_ratio", type=float, default=0.20)
@@ -48,6 +53,7 @@ def parse_args():
     p.add_argument("--high_multiplier", type=float, default=3.0)
     p.add_argument("--topk_reference", choices=["target", "current"], default="target")
     p.add_argument("--high_stability_patience", type=int, default=3)
+    p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
     return p.parse_args()
 
@@ -75,7 +81,8 @@ def main():
     # which makes Colab runtime comparisons less sensitive to session drift.
     for seed in args.seeds:
         for method in args.methods:
-            out = root / f"{method}-seed{seed}"
+            run_label = method if args.rank_init == "uniform" else f"{method}-{args.rank_init}"
+            out = root / f"{run_label}-seed{seed}"
             cmd = [
                 sys.executable,
                 "train_glue.py",
@@ -93,6 +100,11 @@ def main():
                 "--warmup_ratio", str(args.warmup_ratio),
                 "--init_r", str(args.init_r),
                 "--target_r", str(args.target_r),
+                "--rank_init", args.rank_init,
+                "--gora_reference_rank", str(args.gora_reference_rank),
+                "--gora_min_rank", str(args.gora_min_rank),
+                "--gora_max_rank", str(args.gora_max_rank),
+                "--gora_probe_batches", str(args.gora_probe_batches),
                 "--lora_alpha", str(args.lora_alpha),
                 "--adalora_warmup_ratio", str(args.adalora_warmup_ratio),
                 "--adalora_final_ratio", str(args.adalora_final_ratio),
@@ -109,6 +121,7 @@ def main():
                 "--high_multiplier", str(args.high_multiplier),
                 "--topk_reference", args.topk_reference,
                 "--high_stability_patience", str(args.high_stability_patience),
+                "--max_grad_norm", str(args.max_grad_norm),
                 "--output_dir", str(out),
             ]
             if args.tinit_steps is not None:
@@ -126,9 +139,11 @@ def main():
             subprocess.run(cmd, check=True)
             result = json.loads((out / "result.json").read_text())
             target_step = first_target_step(out, result.get("final_budget"))
+            rank_init_metadata = result.get("rank_init_metadata") or {}
             rows.append(
                 {
                     "method": result.get("method"),
+                    "rank_init": result.get("rank_init"),
                     "seed": result.get("seed"),
                     "model_name": result.get("model_name"),
                     "task": result.get("task"),
@@ -143,6 +158,8 @@ def main():
                     "adapter_checkpoint_mb": result.get("adapter_checkpoint_mb"),
                     "final_budget": result.get("final_budget"),
                     "final_active_rank": result.get("final_active_rank"),
+                    "initial_total_rank": rank_init_metadata.get("initial_total_rank"),
+                    "allocator_init_budget": rank_init_metadata.get("allocator_init_budget"),
                     "target_budget_step": target_step,
                     "high_stability_patience": result.get("high_stability_patience"),
                     "resolved_target_modules": json.dumps(result.get("resolved_target_modules")),

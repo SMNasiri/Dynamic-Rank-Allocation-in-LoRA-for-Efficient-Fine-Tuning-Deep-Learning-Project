@@ -23,6 +23,14 @@ from transformers import (
 )
 
 from stability_adalora.allocators import StabilitySettings, install_custom_allocator
+from stability_adalora.gora_init import (
+    GoraRankInitSettings,
+    allocate_gora_ranks,
+    apply_gora_ranks_to_adalora,
+    collect_target_linear_modules,
+    compute_gora_importance,
+    run_gradient_probe,
+)
 
 
 GLUE_TASKS = {
@@ -102,6 +110,20 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--init_r", type=int, default=12)
     p.add_argument("--target_r", type=int, default=4)
+    p.add_argument(
+        "--rank_init",
+        choices=["uniform", "gora"],
+        default="uniform",
+        help=(
+            "Initial AdaLoRA rank layout. 'uniform' preserves the existing "
+            "AdaLoRA behavior; 'gora' runs the supplied GoRA gradient probe "
+            "and uses its per-layer rank allocation before AdaLoRA pruning."
+        ),
+    )
+    p.add_argument("--gora_reference_rank", type=int, default=8)
+    p.add_argument("--gora_min_rank", type=int, default=4)
+    p.add_argument("--gora_max_rank", type=int, default=32)
+    p.add_argument("--gora_probe_batches", type=int, default=64)
     p.add_argument("--lora_alpha", type=int, default=16)
     p.add_argument("--adalora_warmup_ratio", type=float, default=0.10)
     p.add_argument("--adalora_final_ratio", type=float, default=0.20)
@@ -218,7 +240,7 @@ def package_version(name):
         return None
 
 
-def build_model(args):
+def build_model(args, *, train_loader=None, device=None):
     task_info = GLUE_TASKS[args.task]
     target_modules = resolve_target_modules(
         args.model_name,
@@ -232,7 +254,16 @@ def build_model(args):
         problem_type=task_info["problem_type"],
     )
 
+    rank_init_metadata: dict = {
+        "strategy": args.rank_init,
+    }
+
     if args.method == "lora":
+        if args.rank_init != "uniform":
+            raise ValueError(
+                "--rank_init gora is defined for the AdaLoRA/Stability-Aware "
+                "pipeline. Use --rank_init uniform with --method lora."
+            )
         config = LoraConfig(
             task_type=TaskType.SEQ_CLS,
             r=args.target_r,
@@ -241,7 +272,69 @@ def build_model(args):
             target_modules=target_modules,
             bias="none",
         )
-        return get_peft_model(base, config), None, target_modules
+        return get_peft_model(base, config), None, target_modules, rank_init_metadata
+
+    gora_rank_pattern = None
+    if args.rank_init == "gora":
+        if train_loader is None or device is None:
+            raise ValueError(
+                "GoRA rank initialization requires the training dataloader and device."
+            )
+
+        gora_settings = GoraRankInitSettings(
+            reference_rank=args.gora_reference_rank,
+            min_rank=args.gora_min_rank,
+            max_rank=args.gora_max_rank,
+            probe_batches=args.gora_probe_batches,
+        )
+        gora_settings.validate()
+
+        probe_modules = collect_target_linear_modules(base, target_modules)
+        accumulated_grads, batches_used = run_gradient_probe(
+            base,
+            train_loader,
+            probe_modules,
+            n_batches=gora_settings.probe_batches,
+            device=device,
+            max_grad_norm=args.max_grad_norm,
+        )
+        importance = compute_gora_importance(accumulated_grads, probe_modules)
+        gora_rank_pattern, advantages, gora_budget = allocate_gora_ranks(
+            probe_modules,
+            importance,
+            reference_rank=gora_settings.reference_rank,
+            min_rank=gora_settings.min_rank,
+            max_rank=gora_settings.max_rank,
+        )
+
+        initial_total_rank = int(sum(gora_rank_pattern.values()))
+        target_total_rank = int(args.target_r * len(gora_rank_pattern))
+        if initial_total_rank < target_total_rank:
+            raise ValueError(
+                "GoRA produced an initial total rank smaller than AdaLoRA's "
+                f"target budget: {initial_total_rank} < {target_total_rank}. "
+                "Increase --gora_reference_rank/--gora_min_rank or lower --target_r."
+            )
+
+        rank_init_metadata.update(
+            {
+                "settings": gora_settings.to_dict(),
+                "probe_batches_used": int(batches_used),
+                "importance": importance,
+                "advantages": advantages,
+                "gora_weighted_budget": float(gora_budget),
+                "requested_rank_pattern": gora_rank_pattern,
+                "initial_total_rank": initial_total_rank,
+                "target_total_rank": target_total_rank,
+            }
+        )
+
+        # The probe consumes RNG state (dropout and shuffled batches). Reset it
+        # before creating AdaLoRA so adapter initialization stays reproducible.
+        set_seed(args.seed)
+        bootstrap_init_r = max(gora_rank_pattern.values())
+    else:
+        bootstrap_init_r = args.init_r
 
     if args.tinit_steps is not None:
         tinit = int(args.tinit_steps)
@@ -265,7 +358,7 @@ def build_model(args):
 
     config = AdaLoraConfig(
         task_type=TaskType.SEQ_CLS,
-        init_r=args.init_r,
+        init_r=bootstrap_init_r,
         target_r=args.target_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=0.0,
@@ -279,7 +372,16 @@ def build_model(args):
         total_step=args.max_steps,
     )
     model = get_peft_model(base, config)
-    return model, config, target_modules
+
+    if gora_rank_pattern is not None:
+        applied_pattern = apply_gora_ranks_to_adalora(model, gora_rank_pattern)
+        rank_init_metadata["applied_rank_pattern"] = applied_pattern
+        rank_init_metadata["bootstrap_init_r"] = int(bootstrap_init_r)
+        rank_init_metadata["allocator_init_budget"] = int(
+            model.base_model.rankallocator.init_bgt
+        )
+
+    return model, config, target_modules, rank_init_metadata
 
 
 def prepare_data(args, tokenizer):
@@ -482,8 +584,21 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     train_loader, eval_loaders = prepare_data(args, tokenizer)
-    model, adalora_config, resolved_target_modules = build_model(args)
+    model, adalora_config, resolved_target_modules, rank_init_metadata = build_model(
+        args,
+        train_loader=train_loader,
+        device=device,
+    )
+
+    # Reset RNG after an optional GoRA probe so the actual fine-tuning loop has
+    # a deterministic starting RNG state independent of probe length.
+    set_seed(args.seed)
     model.to(device)
+
+    if args.rank_init == "gora":
+        (out_dir / "gora_init.json").write_text(
+            json.dumps(rank_init_metadata, indent=2, sort_keys=True)
+        )
 
     # Precision policy:
     # - In FP32 mode, force the *entire* PEFT model (backbone, adapters, and
@@ -679,6 +794,8 @@ def main():
         "final_active_rank": final_active_rank,
         "final_rank_distribution": final_rank_distribution,
         "resolved_target_modules": resolved_target_modules,
+        "rank_init": args.rank_init,
+        "rank_init_metadata": rank_init_metadata,
         "high_stability_patience": args.high_stability_patience,
         "fp16": bool(args.fp16),
         "max_grad_norm": args.max_grad_norm,
