@@ -1,0 +1,64 @@
+project: stability-aware-continuous-rank-pruning-adalora
+backbone: roberta-base
+dataset: glue
+task: sst2
+max_steps: 1500
+batch_size: 16
+max_length: 128
+learning_rate: 5.0e-4
+seeds: [13, 42, 87]
+
+authoritative_controls:
+  same_total_training_steps: true
+  same_initial_rank_adalora_variants: 12
+  same_final_target_rank_adalora_variants: 4
+  same_target_modules: [query, value]
+  same_optimizer: AdamW
+  same_learning_rate: 5.0e-4
+  same_batch_size: 16
+
+adalora_common:
+  init_r: 12
+  target_r: 4
+  warmup_ratio: 0.10
+  deltaT: 10
+  beta1: 0.85
+  beta2: 0.85
+  orth_reg_weight: 0.5
+
+methods:
+  adalora:
+    final_fixed_ratio: 0.20
+    scheduler: native_cubic
+  adalora_diag:
+    final_fixed_ratio: 0.20
+    scheduler: native_cubic
+    logging_only: [fixed_topk_jaccard, rank_budget, layer_rank_distribution]
+  extended_cubic:
+    final_fixed_ratio: 0.05
+    scheduler: native_cubic_stretched_by_shorter_final_phase
+  stability:
+    final_fixed_ratio: 0.05
+    topk_reference: target_budget
+    policy: multilevel
+    tau_low: 0.70
+    tau_high: 0.90
+    medium_multiplier: 1.5
+    high_multiplier: 3.0
+    deadline_floor: ceil_remaining_rank_over_remaining_checkpoints
+
+primary_metrics:
+  - accuracy
+  - training_seconds
+  - steps_per_second
+  - peak_gpu_allocated_mb
+  - peak_gpu_reserved_mb
+  - adapter_checkpoint_mb
+  - final_budget
+
+diagnostics:
+  - jaccard_stability
+  - q
+  - q_required
+  - q_stability
+  - rank_distribution
